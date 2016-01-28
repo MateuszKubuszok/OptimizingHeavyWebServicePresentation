@@ -182,6 +182,170 @@ val formattedBillings = for {
             </code></pre>
           </section>
         </section>
+
+        <section>
+          <h3>Caching DB requests</h3>
+        </section>
+
+        <section>
+          <section>
+            <h4>Result we'd like to cache</h4>
+            <pre><code class="hljs scala">
+Future {
+  val users     = userRepository.fetchUsers(request.userIds)
+                    .map(user => (user.id, user)).toMap
+  val contracts = contractRepository.findForUserIds(users.keys)
+                    .map(contract => (contract.id, contract)).toMap
+  val billings  = billingRepository.findByContractIds(contracts.keys)
+
+  val formattedBillings = for {
+    billing  <- billings
+    contract <- contract.get(billing.contractId).toSeq
+    user     <- users.get(contract.userId).toSeq
+  } yield formatBilling(user, contract, billing)
+
+  UsersBillingsRes(formattedBillings)
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <pre><code class="hljs json">
+{
+  "EntityKey(user, 1)" : {
+    "user-billings-1,2,5": "",
+    ...
+  },
+  "EntityKey(user, 2)" : {
+    "user-billings-1,2,5": "",
+    ...
+  },
+  ...
+  "user-billings-1,2,5": [serialized value],
+  ...
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <pre><code class="hljs scala">
+case class EntityKey(type: String, id: Long)
+
+trait CacheContext[T] {
+
+  def entityKeys(value: T): Seq[EntityKey] // entities result depends on
+  def serializer: Serializer[T]            // T -> String
+  def deserializer: Deserializer[T]        // String -> T
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <pre><code class="hljs scala">
+trait CacheHandler {
+  def getOrPut[T](valueKey: String, ttl: Duration)
+                 (valueF => Future[T]))
+                 (implicit cacheContext: CacheContext[T],
+                           executionContext: ExecutionContext): Future[T]
+  def invalidate(entityKeys: EntityKey*)
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <h4>Obtaining values from redis</h4>
+            <pre><code class="hljs scala">
+def get[T](key: String)
+          (implicit cacheContext: CacheContext[T],
+                    executionContext: ExecutionContext): Future[T] =
+  redisClient.mget(key) map { gets =>
+    gets.headOption map (_.toArray) map cacheContext.deserializer
+  }
+            </code></pre>
+          </section>
+
+          <section>
+            <h4>Storing values into redis</h4>
+            <pre><code class="hljs scala">
+def put[T](valueKey: String, value: T, ttl: Duration)
+          (implicit cacheContext: CacheContext[T],
+                    executionContext: ExecutionContext): Future[Unit] = {
+  val entityKeys = cacheContext.entityKeys(value)
+  val bytes = cacheContext.serializer(value).bytes
+  val transaction = redisClient.multi()
+  transaction.setex(valueKey, ttl.toSeconds, bytes)
+  entityKeys map (_.toString) map { entityKey =>
+    transaction.hmset(entityKey, Map(valueKey -> Array[Bytes]()))
+    transaction.expire(entityKey, maxTtl.toSeconds)
+  }
+  transaction.exec() map (())
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <pre><code class="hljs scala">
+def getOrPut[T](valueKey: String, ttl: Duration)
+               (valueF => Future[T]))
+               (implicit cacheContext: CacheContext[T],
+                         executionContext: ExecutionContext): Future[T] =
+  get[T](valueKey) flatMap { optionValue =>
+    optionValue map Future.successful getOrElse {
+      for {
+        value <- valueF
+        _     <- put(valueKey, value, ttl)
+      } yield value
+    }
+  }
+            </code></pre>
+          </section>
+
+          <section>
+            <h4>Invalidating values</h4>
+            <pre><code class="hljs scala">
+val transaction = redisClient.multi()
+val keys = entityKeys map (_.toString) map { key =>
+  key -> transaction.hgetall(key) }
+for {
+  _ <- transaction.exec()
+  invTransaction = redisClient.multi()
+  allInvalidatedKeys <- Future.sequence(keys map { case (key, keyMapF) =>
+    keyMapF map { keyMap =>
+      val invKeys = keyMap.keys
+      invTransaction.hdel(key, invKeys:_*)
+      invKeys
+    }
+  }) map (_.flatten)
+  _ = invTransaction.del(allInvalidatedKeys:_*)
+  _ <- invTransaction.exec()
+} yield ()
+            </code></pre>
+          </section>
+
+          <section>
+            <pre><code class="hljs scala">
+implicit val userBillingsContext = new CacheContext[UsersBillingsRes] {
+
+  def entityKeys(value: UsersBillingsRes): Seq[EntityKey] = ...
+  def serializer: Serializer[UsersBillingsRes]            = ...
+  def deserializer: Deserializer[UsersBillingsRes]        = ...
+}
+            </code></pre>
+
+            <pre><code class="hljs scala">
+cacheHandler.getOrPut[UsersBillingsRes](
+    s"user-billings-${request.userIds.mkString}", 10 minutes) {
+  Future {
+    // ...
+
+    UsersBillingsRes(formattedBillings)
+  }
+}
+            </code></pre>
+          </section>
+
+        </section>
+
       </div>
 
     </div>
