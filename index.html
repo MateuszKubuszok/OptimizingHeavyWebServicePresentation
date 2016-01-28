@@ -210,6 +210,7 @@ Future {
           </section>
 
           <section>
+            <h4>How could be acheive that with Redis?</h4>
             <pre><code class="hljs json">
 {
   "EntityKey(user, 1)" : {
@@ -229,7 +230,7 @@ Future {
 
           <section>
             <pre><code class="hljs scala">
-case class EntityKey(type: String, id: Long)
+case class EntityKey(type: String, id: String)
 
 trait CacheContext[T] {
 
@@ -253,7 +254,7 @@ trait CacheHandler {
           </section>
 
           <section>
-            <h4>Obtaining values from redis</h4>
+            <h4>Obtaining values from Redis</h4>
             <pre><code class="hljs scala">
 def get[T](key: String)
           (implicit cacheContext: CacheContext[T],
@@ -265,7 +266,7 @@ def get[T](key: String)
           </section>
 
           <section>
-            <h4>Storing values into redis</h4>
+            <h4>Storing values into Redis</h4>
             <pre><code class="hljs scala">
 def put[T](valueKey: String, value: T, ttl: Duration)
           (implicit cacheContext: CacheContext[T],
@@ -286,14 +287,14 @@ def put[T](valueKey: String, value: T, ttl: Duration)
           <section>
             <pre><code class="hljs scala">
 def getOrPut[T](valueKey: String, ttl: Duration)
-               (valueF => Future[T]))
+               (valueF: => Future[T]))
                (implicit cacheContext: CacheContext[T],
                          executionContext: ExecutionContext): Future[T] =
   get[T](valueKey) flatMap { optionValue =>
     optionValue map Future.successful getOrElse {
       for {
         value <- valueF
-        _     <- put(valueKey, value, ttl)
+        _     <- put[T](valueKey, value, ttl)
       } yield value
     }
   }
@@ -344,6 +345,191 @@ cacheHandler.getOrPut[UsersBillingsRes](
             </code></pre>
           </section>
 
+        </section>
+
+        <section>
+          <section>
+            <h3>Caching API requests</h3>
+          </section>
+
+          <section>
+            <pre><code class="hljs scala">
+trait UsersControllerImpl extends UsersController {
+
+  def getBillingsForCurrentUserAndContractor(userId: Long) =
+      authenticatedRequest { request =>
+    val observedEntityId   = userId
+    val observedEntityType = "user"
+    val currentUserId = currentUser.id
+
+    for {
+      result <- userServices.getContractBillingsForPair(
+          ContractBillingsForPairReuqest(userId, currentUserId))
+    } yield {
+      // create JSON from user
+    }
+  }
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <h4>Lets improve CacheHandler a little</h4>
+            <pre><code class="hljs scala">
+def getOrPut[T](valueKey: String, ttl: Duration, request: Request)
+               (valueF => Future[T]))
+               (implicit cacheContext: RequestCacheContext[T],
+                         executionContext: ExecutionContext): Future[T] = {
+  val uri    = request.uri
+  val header = request.headers.get(Headers.Authentication)
+                              .getOrElse("")
+  val params = request.params.map { case (name, value) =>
+    name + ":" + value.sorted.toString
+  }.toSeq.sorted
+  val requestSuffix = s"$uri-$header-${params.mkString}"
+
+  getOrPut[T](s"$value-$requestSuffix", ttl)(valueF)
+}
+            </code></pre>
+          </section>
+
+          <section>
+            <pre><code class="hljs scala">
+def getBillingsForCurrentUserAndContractor(userId: Long) =
+    authenticatedRequest { request =>
+  val observedEntityId = userId
+  val currentUserId    = currentUser.id
+
+  cacheHandler.getOrPut[BillingJsonResult](
+      "api-billings-for-$userId", 10 minutes, request) {
+    for {
+      result <- userServices.getContractBillingsForPair(
+          ContractBillingsForPairReuqest(userId, currentUserId))
+    } yield {
+      // create JSON from user
+    }
+  }
+}
+            </code></pre>
+          </section>
+
+        </section>
+
+        <section>
+          <section>
+            <h2>Removal of redundant queries</h2>
+          </section>
+
+          <section>
+             <pre><code class="hljs scala">
+val users     = userRepository.fetchUsers(request.userIds)
+                  .map(user => (user.id, user)).toMap
+val contracts = contractRepository.findForUserIds(users.keys)
+                  .map(contract => (contract.id, contract)).toMap
+val billings  = billingRepository.findByContractIds(contracts.keys)
+
+val formattedBillings = for {
+  billing  <- billings
+  contract <- contract.get(billing.contractId).toSeq
+  user     <- users.get(contract.userId).toSeq
+} yield formatBilling(user, contract, billing)
+
+UsersBillingsRes(formattedBillings)
+            </code></pre>
+          </section>
+
+          <section>
+             <pre><code class="hljs json">
+[
+  {
+    "id": 5543,
+    "date": "2015-10-23",
+    ...
+    "_links": ...,
+    "_embedded": {
+      "user": {
+        "id": 1,
+        "name": "John",
+        "surname": "Smith",
+        ...
+      },
+      "contract": {
+        "id": 646,
+        ...
+      },
+      "billings": {
+        "id": 766,
+        ...
+      }
+    }
+  },
+  ...
+]
+            </code></pre>
+          </section>
+
+          <section>
+            <h3>Was it all really needed?</h3>
+
+            <p class="fragment">No!</p>
+            <p class="fragment">We actually needed:
+              <ul>
+                <li class="fragment">Billing</li>
+                <li class="fragment">User ID</li>
+                <li class="fragment">Contract ID</li>
+              </ul>
+            </p>
+          </section>
+
+          <section>
+             <pre><code class="hljs scala">
+// UserId -> Billings
+val billingsByUsers: Map[Long, Seq[Billing]] =
+    billingRepository.findByUserIds(request.userIds)
+
+val formattedBillings = for {
+  (userId, billings) <- billingsByUsers
+  billing            <- billings
+  contractId        = billing.contractId
+} yield formatBilling(userId, contractId, billing)
+
+UsersBillingsResponse(formattedBillings)
+            </code></pre>
+          </section>
+
+          <section>
+             <pre><code class="hljs json">
+[
+  {
+    "id": 5543,
+    "date": "2015-10-23",
+    "userId": 1,
+    "contractId": 646,
+    ...
+  },
+  ...
+]
+            </code></pre>
+          </section>
+
+        </section>
+
+        <section>
+          <h2>Summary</h2>
+          <ul>
+            <li class="fragment">measure what needs to be optimized</li>
+            <li class="fragment">avoid n+1 queries</li>
+            <li class="fragment">cache queries and API requests when necessary</li>
+            <li class="fragment">keep things simple and small</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>Questions?</h2>
+        </section>
+
+        <section>
+          <h2>Thank you!</h2>
         </section>
 
       </div>
